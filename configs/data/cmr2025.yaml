@@ -1,0 +1,17 @@
+# CMR2025 Dataset Configuration for PromptMR-plus
+data:
+  class_path: data.cmr2025.CMR2025DataModule
+  init_args:
+    data_path: ./h5_dataset_simplified  # Path to your h5 dataset
+    train_path: ./h5_dataset_simplified/train  # Path to training data
+    val_path: ./h5_dataset_simplified/val  # Path to validation data
+    sample_rate: 0.5  # Adjust based on your dataset size and memory constraints
+    volume_sample_rate: 1.0
+    train_accelerations: [4, 8, 12]  # Acceleration factors for training
+    val_accelerations: [4, 8, 12]  # Acceleration factors for validation
+    crop_size: [320, 320]  # Adjust based on your dataset dimensions
+    batch_size: 4  # Adjust based on your GPU memory
+    num_workers: 4  # Reduced to avoid potential issues
+    use_seed: true
+    pad_sides: false
+    fix_acceleration_val: 8  # Fixed acceleration for validation
