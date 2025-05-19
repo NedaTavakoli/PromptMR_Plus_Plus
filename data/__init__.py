@@ -34,3 +34,20 @@ from .subsample import (
     CmrxRecon24TestValMaskFunc
 )
 
+def train_dataloader(self):
+    return DataLoader(
+        self.train_dataset,
+        batch_size=self.batch_size,
+        num_workers=self.num_workers,
+        pin_memory=True,
+        collate_fn=PromptMrModule.custom_collate,  # Use the custom collate function
+    )
+
+def val_dataloader(self):
+    return DataLoader(
+        self.val_dataset,
+        batch_size=self.batch_size,
+        num_workers=self.num_workers,
+        pin_memory=True,
+        collate_fn=PromptMrModule.custom_collate,  # Use the custom collate function
+    )

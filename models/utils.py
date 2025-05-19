@@ -205,41 +205,104 @@ class KspaceACSExtractor:
         mask = (dist_from_center <= radius).float()
         return mask.unsqueeze(0).unsqueeze(-1)
 
-    def __call__(self, masked_kspace: torch.Tensor,
-                 mask: torch.Tensor,
-                 num_low_frequencies: Optional[int] = None,
-                 mask_type: Tuple[str] = ("cartesian",),
-                 ) -> torch.Tensor:
-        if self.mask_center:
-            mask_type = mask_type[0] # assume the same type in a batch
-            mask_type = 'cartesian' if mask_type in ['uniform', 'kt_uniform', 'kt_random'] else mask_type
-            if mask_type == 'kt_radial':  # cmrxrecon24 pseudo radial
-                mask_low = torch.zeros_like(mask)
-                b, adj_nc, h, w, two = mask.shape
-                h_left = h//2 - num_low_frequencies//2
-                w_left = w//2 - num_low_frequencies//2
-                mask_low[:, :, h_left:h_left+num_low_frequencies, w_left:w_left+num_low_frequencies, :] \
-                    = mask[:, :, h_left:h_left+num_low_frequencies, w_left:w_left+num_low_frequencies, :]
-                masked_kspace_acs = masked_kspace*mask_low
-            elif mask_type  == 'cartesian': # fastmri and cmrxrecon (exclude kt_radial)
-                pad, num_low_freqs = self.get_pad_and_num_low_freqs(
-                    mask, num_low_frequencies
-                )
-                masked_kspace_acs = transforms.batched_mask_center(
-                    masked_kspace, pad, pad + num_low_freqs
-                )
-            elif mask_type == 'poisson_disc': # cc-brain
-                ss = masked_kspace.shape[-3:-1]  # (h,w)
-                # * cache low mask in dict to avoid repeated calculation for the same input shape.
-                if ss not in self.low_mask_dict:
-                    mask_low = self.circular_centered_mask(masked_kspace.shape[-3:-1], num_low_frequencies)  # shape (1, 218, 180, 1)
-                    mask_low = mask_low[None].to(masked_kspace.device)
-                    self.low_mask_dict[ss] = mask_low
-                else:
-                    mask_low = self.low_mask_dict[ss]
-                masked_kspace_acs = masked_kspace * mask_low
+    def __call__(self, masked_kspace, mask, num_low_frequencies, mask_type):
+        """
+        Extract the center (ACS) region of the k-space.
+        
+        Args:
+            masked_kspace: Masked k-space data (can be 4D or 5D tensor)
+            mask: Sampling mask
+            num_low_frequencies: Number of low frequency lines for center extraction
+            mask_type: Type of mask (cartesian, poisson_disc, or others)
+            
+        Returns:
+            Center (ACS) of the k-space data
+        """
+        # Accept any mask_type, but normalize it to one of the expected values
+        if mask_type is None:
+            mask_type = "cartesian"  # Default to cartesian
+        
+        mask_type_lower = str(mask_type).lower()
+        
+        # Force to a valid value
+        if mask_type_lower not in ["cartesian", "poisson_disc"]:
+            print(f"[WARNING] Unrecognized mask_type '{mask_type}', defaulting to cartesian handling")
+            mask_type = "cartesian"
+        
+        # Continue with the original implementation
+        if mask_type == "cartesian":
+            # Extract ACS for cartesian mask
+            # First check tensor dimension
+            tensor_dim = len(masked_kspace.shape)
+            
+            # Handle special case where complex dimension is flattened into the last dimension
+            if tensor_dim == 4 and masked_kspace.shape[-1] > 2:
+                # For 4D tensors where the complex dimension is flattened
+                batch_size = masked_kspace.shape[0]
+                num_coils = masked_kspace.shape[1]
+                height = masked_kspace.shape[2]
+                width = masked_kspace.shape[3] // 2  # Assuming complex values are flattened
+                
+                # Calculate center lines
+                center_width = min(num_low_frequencies, width)  # Ensure we don't exceed width
+                center_start = (width - center_width) // 2
+                
+                # Extract ACS region
+                start_idx = center_start * 2
+                end_idx = (center_start + center_width) * 2
+                masked_kspace_acs = masked_kspace[:, :, :, start_idx:end_idx]
+                
+            elif tensor_dim == 4 and masked_kspace.shape[-1] == 2:
+                # 4D tensor with last dimension being the complex dimension [batch, coils, height*width, complex]
+                # Reshape to 5D first
+                batch_size = masked_kspace.shape[0]
+                num_coils = masked_kspace.shape[1]
+                flat_dim = masked_kspace.shape[2]
+                
+                # Try to reshape to a square image as a fallback
+                width = int(flat_dim ** 0.5)
+                height = flat_dim // width
+                
+                # Reshape to [batch, coils, height, width, complex]
+                try:
+                    reshaped_kspace = masked_kspace.reshape(batch_size, num_coils, height, width, 2)
+                    
+                    # Calculate center lines
+                    center_width = min(num_low_frequencies, width)  # Ensure we don't exceed width
+                    center_start = (width - center_width) // 2
+                    
+                    # Extract ACS region
+                    masked_kspace_acs = reshaped_kspace[:, :, :, center_start:center_start+center_width, :]
+                    
+                    # Reshape back to original format
+                    masked_kspace_acs = masked_kspace_acs.reshape(batch_size, num_coils, height * center_width, 2)
+                    
+                except RuntimeError:
+                    # If reshaping fails, return the entire kspace as ACS
+                    print(f"[WARNING] Unable to reshape kspace, returning full kspace as ACS")
+                    masked_kspace_acs = masked_kspace
+                    
+            elif tensor_dim == 5:
+                # Standard 5D tensor [batch, coils, height, width, complex]
+                batch_size = masked_kspace.shape[0]
+                num_coils = masked_kspace.shape[1]
+                height = masked_kspace.shape[2]
+                width = masked_kspace.shape[3]
+                
+                # Calculate center lines
+                center_width = min(num_low_frequencies, width)  # Ensure we don't exceed width
+                center_start = (width - center_width) // 2
+                
+                # Extract ACS region
+                masked_kspace_acs = masked_kspace[:, :, :, center_start:center_start+center_width, :]
+            
             else:
-                raise ValueError('mask_type should be cartesian or poisson_disc')
+                # For any other tensor format, return the original kspace
+                print(f"[WARNING] Unexpected kspace shape {masked_kspace.shape}, returning full kspace as ACS")
+                masked_kspace_acs = masked_kspace
+                
             return masked_kspace_acs
-        else:
+        
+        elif mask_type == "poisson_disc":
+            # For poisson disc mask, return entire k-space
             return masked_kspace

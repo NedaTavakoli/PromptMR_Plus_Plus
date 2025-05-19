@@ -169,8 +169,24 @@ class MriModule(L.LightningModule):
         ssim_vals = defaultdict(dict)
         max_vals = dict()
         for i, fname in enumerate(val_logs["fname"]):
-            slice_num = int(val_logs["slice_num"][i].cpu())
-            maxval = val_logs["max_value"][i].cpu().numpy()
+            # Handle slice_num safely
+            if isinstance(val_logs["slice_num"], list):
+                slice_num = int(val_logs["slice_num"][i])
+            else:
+                slice_num = int(val_logs["slice_num"][i].cpu())
+            
+            # Handle max_value safely
+            if isinstance(val_logs["max_value"], torch.Tensor):
+                if val_logs["max_value"].ndim == 0:  # scalar tensor
+                    maxval = val_logs["max_value"].item()
+                else:  # multi-dimensional tensor
+                    maxval = val_logs["max_value"][i].cpu().numpy()
+            elif isinstance(val_logs["max_value"], (list, tuple)):
+                maxval = val_logs["max_value"][i]
+            else:
+                maxval = val_logs["max_value"]  # Assume it's a scalar
+            
+            # Handle output and target safely
             output = val_logs["output"][i].cpu().numpy()
             target = val_logs["target"][i].cpu().numpy()
 
@@ -317,4 +333,5 @@ class MriModule(L.LightningModule):
 
         save_reconstructions(outputs, save_path)
 
+  
     

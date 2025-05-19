@@ -10,6 +10,9 @@ from collections import defaultdict
 import yaml
 import torch
 import numpy as np
+import types
+from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 
 from lightning.pytorch.cli import LightningCLI, SaveConfigCallback
 from lightning.pytorch.callbacks import BasePredictionWriter
@@ -19,6 +22,67 @@ from mri_utils.utils import save_reconstructions  # Import directly from the uti
 
 from pl_modules import PromptMrModule
 
+def custom_collate(batch):
+    """
+    Custom collate function to handle batches with varying tensor shapes.
+    """
+    if len(batch) == 0:
+        return {}
+        
+    result = {}
+    elem = batch[0]
+    
+    # Handle batch where elements are dicts
+    if isinstance(elem, dict):
+        for key in elem:
+            if key in ['fname', 'slice_num']:
+                # These can be lists or tensors - collect them as lists
+                result[key] = [b[key] for b in batch]
+            elif key == 'max_value':
+                # Handle max_value which might be scalar or tensor
+                max_values = [b[key] for b in batch]
+                if all(isinstance(m, (int, float)) for m in max_values):
+                    result[key] = max_values
+                else:
+                    try:
+                        result[key] = torch.stack([torch.tensor(m) for m in max_values])
+                    except:
+                        result[key] = max_values
+            elif isinstance(elem[key], torch.Tensor):
+                # For tensors, handle different shapes
+                try:
+                    if key == 'kspace' or key == 'masked_kspace':
+                        # For kspace data, just collect as a list if shapes don't match
+                        if all(b[key].shape[2:] == elem[key].shape[2:] for b in batch):
+                            result[key] = default_collate([b[key] for b in batch])
+                        else:
+                            result[key] = [b[key] for b in batch]
+                    elif key == 'mask':
+                        # For mask data, just collect as a list if shapes don't match
+                        if all(b[key].shape == elem[key].shape for b in batch):
+                            result[key] = default_collate([b[key] for b in batch])
+                        else:
+                            result[key] = [b[key] for b in batch]
+                    else:
+                        # Try standard collate for other tensor keys
+                        result[key] = default_collate([b[key] for b in batch])
+                except:
+                    # If default_collate fails, just collect as a list
+                    result[key] = [b[key] for b in batch]
+            else:
+                # Handle other types (lists, strings, etc.)
+                try:
+                    result[key] = default_collate([b[key] for b in batch])
+                except:
+                    result[key] = [b[key] for b in batch]
+    else:
+        # Just use default_collate for non-dict batch elements
+        try:
+            return default_collate(batch)
+        except:
+            return batch
+            
+    return result
 
 def preprocess_save_dir():
     """Ensure `save_dir` exists, handling both command-line arguments and YAML configuration."""
@@ -176,22 +240,87 @@ class CustomWriter(BasePredictionWriter):
         save_reconstructions(outputs, num_slc_dict, self.output_dir / "reconstructions")
         print(f"Done! Reconstructions saved to {self.output_dir / 'reconstructions'}")
 
-class CustomLightningCLI(LightningCLI):
 
+class CustomLightningCLI(LightningCLI):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
     def instantiate_classes(self):
         super().instantiate_classes()
-        if self.config_init.subcommand == 'predict':
+        if hasattr(self, 'config_init') and hasattr(self.config_init, 'subcommand') and self.config_init.subcommand == 'predict':
             self.model = PromptMrModule.load_from_checkpoint(self.config_init.predict.ckpt_path)
+        
+        # Patch the datamodule's dataloaders to use custom collate
+        self._patch_datamodule()
+    
+    def _patch_datamodule(self):
+        """Patch the datamodule to use custom collate function"""
+        if not hasattr(self, "datamodule") or self.datamodule is None:
+            return
+            
+        # Store original methods
+        if hasattr(self.datamodule, 'train_dataloader'):
+            original_train_dataloader = self.datamodule.train_dataloader
+            
+            # Create patched train_dataloader method
+            def patched_train_dataloader(self):
+                # Get the original dataloader
+                dataloader = original_train_dataloader()
+                if hasattr(dataloader, 'collate_fn') and dataloader.collate_fn == custom_collate:
+                    # Already patched
+                    return dataloader
+                    
+                # Create a new dataloader with our custom collate function
+                new_dataloader = DataLoader(
+                    dataloader.dataset,
+                    batch_size=dataloader.batch_size,
+                    shuffle=hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, torch.utils.data.sampler.RandomSampler),
+                    num_workers=dataloader.num_workers,
+                    pin_memory=getattr(dataloader, 'pin_memory', False),
+                    drop_last=getattr(dataloader, 'drop_last', False),
+                    collate_fn=custom_collate,
+                )
+                return new_dataloader
+            
+            # Apply the patch
+            self.datamodule.train_dataloader = types.MethodType(patched_train_dataloader, self.datamodule)
+        
+        # Patch val_dataloader if it exists
+        if hasattr(self.datamodule, 'val_dataloader'):
+            original_val_dataloader = self.datamodule.val_dataloader
+            
+            # Create patched val_dataloader method
+            def patched_val_dataloader(self):
+                # Get the original dataloader
+                dataloader = original_val_dataloader()
+                if hasattr(dataloader, 'collate_fn') and dataloader.collate_fn == custom_collate:
+                    # Already patched
+                    return dataloader
+                    
+                # Create a new dataloader with our custom collate function
+                new_dataloader = DataLoader(
+                    dataloader.dataset,
+                    batch_size=dataloader.batch_size,
+                    shuffle=False,  # Don't shuffle validation
+                    num_workers=dataloader.num_workers,
+                    pin_memory=getattr(dataloader, 'pin_memory', False),
+                    drop_last=getattr(dataloader, 'drop_last', False),
+                    collate_fn=custom_collate,
+                )
+                return new_dataloader
+            
+            # Apply the patch
+            self.datamodule.val_dataloader = types.MethodType(patched_val_dataloader, self.datamodule)
 
 
 def run_cli():
-
     preprocess_save_dir()
 
     cli = CustomLightningCLI(
         save_config_callback=CustomSaveConfigCallback,
         save_config_kwargs={"overwrite": True},
     )
+
 
 if __name__ == "__main__":
     run_cli()
