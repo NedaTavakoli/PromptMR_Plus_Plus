@@ -1,654 +1,633 @@
-"""
-Fully self-contained CMR2025 DataModule for PromptMR-plus with fixed data type handling
-This module implements all required functionality without depending on external functions.
-
-This file should be placed in data/cmr2025.py in the PromptMR-plus repository.
-"""
 import os
-import glob
 import random
-import numpy as np
 import h5py
-from typing import Optional, List, Tuple, Union, Callable
-from multiprocessing import cpu_count
-
+import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+import lightning.pytorch as pl  # Make sure to use this import
 
-import lightning.pytorch as pl
-from lightning.pytorch.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
+# Import the necessary functions for the patched forward method
+from mri_utils.coil_combine import sens_expand, sens_reduce
 
-# Only import absolute necessities from mri_utils, with fallbacks
-try:
-    from mri_utils import rss
-except ImportError:
-    # Implement our own rss function
-    def rss(data, dim=0):
-        """
-        Root sum of squares along a specified dimension
-        """
-        return torch.sqrt((data ** 2).sum(dim))
-
-try:
-    from mri_utils import fft2c
-except ImportError:
-    # Implement our own fft2c function
-    def fft2c(data):
-        """
-        Apply centered 2D FFT
-        """
-        assert data.size(-1) == 2, "Last dimension should be 2 (real and imaginary parts)"
-        data = torch.view_as_complex(data)
-        data = torch.fft.ifftshift(data, dim=(-2, -1))
-        data = torch.fft.fft2(data, dim=(-2, -1), norm='ortho')
-        data = torch.fft.fftshift(data, dim=(-2, -1))
-        return torch.view_as_real(data)
-
-try:
-    from mri_utils import ifft2c
-except ImportError:
-    # Implement our own ifft2c function
-    def ifft2c(data):
-        """
-        Apply centered 2D IFFT
-        """
-        assert data.size(-1) == 2, "Last dimension should be 2 (real and imaginary parts)"
-        data = torch.view_as_complex(data)
-        data = torch.fft.ifftshift(data, dim=(-2, -1))
-        data = torch.fft.ifft2(data, dim=(-2, -1), norm='ortho')
-        data = torch.fft.fftshift(data, dim=(-2, -1))
-        return torch.view_as_real(data)
-
-# Implement our own complex_center_crop
-def complex_center_crop(data, shape):
+def complex_center_crop(data, crop_size):
     """
-    Apply a center crop to complex data.
+    Apply center crop to complex-valued tensor, with handling for crop sizes larger than input.
     
     Args:
-        data: Input data with the last dimension containing real and imaginary parts
-        shape: Desired output shape
+        data: Input complex data
+        crop_size: Desired crop size
         
     Returns:
-        Center cropped data
+        Cropped data
     """
-    if not (0 < shape[0] <= data.shape[-3] and 0 < shape[1] <= data.shape[-2]):
-        raise ValueError("Crop shape should be smaller than input shape")
+    if not isinstance(crop_size, (list, tuple)):
+        crop_size = (crop_size, crop_size)
     
-    w_from = (data.shape[-3] - shape[0]) // 2
-    h_from = (data.shape[-2] - shape[1]) // 2
-    w_to = w_from + shape[0]
-    h_to = h_from + shape[1]
+    # Get dimensions   
+    h, w = data.shape[-2], data.shape[-1]
     
-    return data[..., w_from:w_to, h_from:h_to, :]
+    # Check if crop size is larger than input size and adjust
+    crop_h = min(h, crop_size[0])
+    crop_w = min(w, crop_size[1])
+    
+    # Calculate cropping indices
+    start_h = (h - crop_h) // 2
+    start_w = (w - crop_w) // 2
+    
+    # Perform the crop based on tensor dimensionality
+    if len(data.shape) == 3:  # 2D case
+        return data[start_h:start_h + crop_h, start_w:start_w + crop_w, :]
+    elif len(data.shape) == 4:  # 2D with batch
+        return data[:, start_h:start_h + crop_h, start_w:start_w + crop_w, :]
+    elif len(data.shape) == 5:  # 3D case
+        return data[:, :, start_h:start_h + crop_h, start_w:start_w + crop_w, :]
+    elif len(data.shape) == 6:  # 3D with batch
+        return data[:, :, :, start_h:start_h + crop_h, start_w:start_w + crop_w, :]
+    else:
+        raise ValueError(f"Unsupported tensor shape: {data.shape}")
 
-# Implement our own complex_random_crop
-def complex_random_crop(data, shape):
+def complex_abs(data):
     """
-    Apply a random crop to complex data.
+    Compute the absolute value of a complex tensor.
     
     Args:
-        data: Input data with the last dimension containing real and imaginary parts
-        shape: Desired output shape
+        data: Complex data with last dimension being 2 (real and imaginary)
         
     Returns:
-        Randomly cropped data
+        Absolute value of complex data
     """
-    if not (0 < shape[0] <= data.shape[-3] and 0 < shape[1] <= data.shape[-2]):
-        raise ValueError("Crop shape should be smaller than input shape")
-    
-    w_from = np.random.randint(0, data.shape[-3] - shape[0] + 1)
-    h_from = np.random.randint(0, data.shape[-2] - shape[1] + 1)
-    w_to = w_from + shape[0]
-    h_to = h_from + shape[1]
-    
-    return data[..., w_from:w_to, h_from:h_to, :]
+    assert data.size(-1) == 2
+    return torch.sqrt((data ** 2).sum(dim=-1))
 
-# Implement our own random mask functionality
-def create_mask_for_accelerations(shape, acceleration, calib_size=16, seed=None):
+def create_mask(shape, acc_factor):
     """
-    Create a random mask for a given acceleration factor
+    Create a 1D sampling mask for given acceleration factor.
     
     Args:
         shape: Shape of the mask
-        acceleration: Acceleration factor
-        calib_size: Size of the calibration region
-        seed: Random seed
-    
-    Returns:
-        Binary mask
-    """
-    if seed is not None:
-        np.random.seed(seed)
+        acc_factor: Acceleration factor
         
-    mask = np.zeros(shape)
+    Returns:
+        Mask tensor
+    """
+    num_cols = shape[1]
+    center_fraction = 0.08
     
-    # Calculate the center indices
-    center_h, center_w = shape[0] // 2, shape[1] // 2
+    # Create the mask
+    num_low_frequencies = int(round(num_cols * center_fraction))
+    prob = (num_cols / acc_factor - num_low_frequencies) / (num_cols - num_low_frequencies)
+    mask = np.random.random(num_cols) < prob
     
-    # Create calibration region
-    calib_h_start = center_h - calib_size // 2
-    calib_h_end = calib_h_start + calib_size
-    calib_w_start = center_w - calib_size // 2
-    calib_w_end = calib_w_start + calib_size
+    # Always include the center
+    pad = (num_cols - num_low_frequencies + 1) // 2
+    mask[pad:pad + num_low_frequencies] = True
     
-    # Set calibration region to 1
-    mask[calib_h_start:calib_h_end, calib_w_start:calib_w_end] = 1
+    # Reshape the mask
+    mask_shape = [1 for _ in shape]
+    mask_shape[1] = num_cols
+    mask = torch.from_numpy(mask.reshape(*mask_shape).astype(np.float32))
     
-    # Calculate number of lines to sample
-    num_lines = shape[0] // acceleration
-    
-    # Create probability distribution (higher probability in the center)
-    pdf = np.zeros(shape[0])
-    pdf_range = np.arange(shape[0]) - shape[0] // 2
-    pdf = 1 / (1 + abs(pdf_range) ** 2)
-    pdf[calib_h_start:calib_h_end] = 0  # Zero out the calibration region
-    
-    # Normalize the PDF
-    if pdf.sum() > 0:
-        pdf = pdf / pdf.sum()
-    
-    # Select random lines based on PDF
-    selected_lines = np.random.choice(
-        shape[0],
-        size=num_lines - calib_size,
-        replace=False,
-        p=pdf
-    )
-    
-    # Apply the mask
-    mask[selected_lines, :] = 1
+    # Create mask for complex data (both real and imaginary)
+    mask = torch.cat([mask, mask], dim=-1)
     
     return mask
 
-# Create get_mask_func factory
-def get_mask_func(acceleration, calib_size=16, seed=None):
+def normalize(data, mean=None, std=None, eps=0.0):
     """
-    Factory function that returns a mask function
-    
-    Args:
-        acceleration: Acceleration factor
-        calib_size: Size of the calibration region
-        seed: Random seed
-    
-    Returns:
-        Mask function that takes a shape and returns a mask
-    """
-    def _mask_func(shape):
-        return create_mask_for_accelerations(shape, acceleration, calib_size, seed)
-    
-    return _mask_func
-
-# Helper functions for data loading
-def retrieve_metadata_from_file(fname):
-    """
-    Read metadata from h5 file.
-    
-    Args:
-        fname: Path to h5 file
-        
-    Returns:
-        Dictionary with metadata
-    """
-    with h5py.File(fname, 'r') as hf:
-        metadata = {}
-        for key in hf.attrs:
-            metadata[key] = hf.attrs[key]
-        
-        # Add shape if available
-        if 'kspace' in hf:
-            metadata['shape'] = hf['kspace'].shape
-            
-    return metadata
-
-def normalize_instance(data, mean=None, std=None, eps=0.0):
-    """
-    Normalize data to zero mean and unit standard deviation.
+    Normalize complex data by mean and standard deviation.
     
     Args:
         data: Input data
-        mean: Mean to use for normalization (if None, calculated from data)
-        std: Standard deviation to use for normalization (if None, calculated from data)
-        eps: Small constant for numerical stability
+        mean: Mean value (if None, computed from data)
+        std: Standard deviation (if None, computed from data)
+        eps: Small constant to avoid division by zero
         
     Returns:
-        Normalized data, mean, standard deviation
+        Normalized data, mean, std
     """
     if mean is None:
         mean = data.mean()
     if std is None:
         std = data.std()
+    
     return (data - mean) / (std + eps), mean, std
+
+def create_batch(kspace, mask, sensitivity_maps, target, attrs, crop_size):
+    """
+    Create a batch from raw data components, ensuring no None values.
+    """
+    batch = {
+        'kspace': kspace,
+        'masked_kspace': kspace,  # Include both keys to be safe
+        'mask': mask,
+        'mask_type': 'cartesian',  # Always include a valid mask_type
+        'attrs': attrs if attrs is not None else {},
+        'crop_size': crop_size
+    }
+    
+    # Add low frequencies if available in attrs
+    if attrs and 'num_low_frequencies' in attrs:
+        batch['num_low_frequencies'] = attrs['num_low_frequencies']
+    else:
+        # A reasonable default, adjust as needed
+        batch['num_low_frequencies'] = 8
+    
+    # Only add target if it's not None
+    if target is not None:
+        batch['target'] = target
+    
+    # Only add sensitivity_maps if it's not None
+    if sensitivity_maps is not None:
+        batch['sensitivity_maps'] = sensitivity_maps
+    
+    return batch
+
+def apply_mask_to_kspace(kspace, mask):
+    """
+    Apply a sampling mask to kspace data with proper broadcasting.
+    
+    Args:
+        kspace: K-space data with shape [batch, coils, height, width, complex]
+        mask: Sampling mask
+        
+    Returns:
+        Masked k-space data
+    """
+    print(f"Inside apply_mask_to_kspace - kspace: {kspace.shape}, mask: {mask.shape}")
+    
+    # Get the shapes
+    kspace_shape = kspace.shape
+    mask_shape = mask.shape
+    
+    try:
+        # For mask with shape [1, 10, 1, 2] and kspace with shape [batch, 10, height, width, 2]
+        if len(mask_shape) == 4 and len(kspace_shape) == 5:
+            if mask_shape[2] == 1:  # Height is 1 in mask
+                # Expand mask to match kspace dimensions
+                expanded_mask = mask.expand(-1, -1, kspace_shape[2], -1)  # Expand height
+                # Now mask is [1, 10, height, 2]
+                
+                # Further reshape if needed
+                if kspace_shape[3] > 1 and expanded_mask.shape[3] == 2:
+                    # We need to expand the width dimension too
+                    expanded_mask = expanded_mask.unsqueeze(3).expand(-1, -1, -1, kspace_shape[3], -1)
+                    # Now mask is [1, 10, height, width, 2]
+                
+                # Finally expand batch if needed
+                if kspace_shape[0] > 1 and expanded_mask.shape[0] == 1:
+                    expanded_mask = expanded_mask.expand(kspace_shape[0], -1, -1, -1, -1)
+                
+                print(f"Expanded mask shape: {expanded_mask.shape}")
+                return kspace * expanded_mask
+        
+        # If we got here, try a simpler approach - direct multiplication with broadcasting
+        return kspace * mask
+        
+    except RuntimeError as e:
+        print(f"Error in masking: {e}")
+        
+        # Create a new mask with the same shape as kspace
+        new_mask = torch.ones_like(kspace)
+        
+        # Copy the mask values into the appropriate dimensions
+        for i in range(kspace_shape[0]):  # Batch dimension
+            for j in range(min(kspace_shape[1], mask_shape[1])):  # Coil dimension (limited by smaller one)
+                # Get the mask value for this coil
+                mask_val = mask[0, j, 0, :] if mask_shape[0] == 1 else mask[i, j, 0, :]
+                
+                # Apply it across all spatial dimensions
+                new_mask[i, j, :, :, :] = mask_val.view(1, 1, 2)
+        
+        print(f"Created custom mask with shape: {new_mask.shape}")
+        return kspace * new_mask
+
+def convert_paths_to_strings(item):
+    """
+    Recursively convert Path objects to strings in a nested data structure.
+    
+    Args:
+        item: The item to convert (can be a dict, list, Path, or other type)
+        
+    Returns:
+        The converted item with Path objects replaced by strings
+    """
+    if isinstance(item, (Path, type(Path()))):
+        return str(item)
+    elif isinstance(item, dict):
+        return {k: convert_paths_to_strings(v) for k, v in item.items()}
+    elif isinstance(item, list):
+        return [convert_paths_to_strings(x) for x in item]
+    elif isinstance(item, tuple):
+        return tuple(convert_paths_to_strings(x) for x in item)
+    else:
+        return item
+
 
 
 class CMR2025Dataset(Dataset):
     """
-    Dataset class for CMR2025 dataset.
+    Dataset for CMR 2025 challenge.
     """
+    
     def __init__(
         self,
-        files: List[str],
-        acceleration: Optional[Union[int, List[int]]] = None,
-        acquisition: Optional[List[str]] = None,
-        crop_size: Optional[Tuple[int, int]] = None,
-        mode: str = 'train',
-        sample_rate: Optional[float] = None,
-        volume_sample_rate: Optional[float] = None,
-        use_seed: bool = True,
-        pad_sides: bool = False,
-        load_directly: bool = False,
-        fix_acceleration: Optional[int] = None,
+        data_path,
+        transform=None,
+        challenge='multicoil',
+        sample_rate=1.0,
+        volume_sample_rate=None,
+        use_dataset_cache=True,
+        crop_size=(320, 190),  # Adjusted to be smaller than smallest dimension
+        seed=42,
+        train_accelerations=[4, 8, 12],
+        pad_sides=False,
         **kwargs
     ):
         """
+        Initialize the dataset.
+        
         Args:
-            files: List of h5 files to load
-            acceleration: Desired acceleration rate. Can be a single number or a list
-            acquisition: Type of acquisition
-            crop_size: Desired output size
-            mode: train or val
-            sample_rate: Rate at which to sample the slices
-            volume_sample_rate: Rate at which to sample the volumes
-            use_seed: Whether to use a fixed random seed for slice sampling
-            pad_sides: Whether to pad the sides of k-space
-            load_directly: Whether to load the data directly
-            fix_acceleration: Fixed acceleration rate (for validation)
+            data_path: Path to the dataset
+            transform: Optional transform
+            challenge: Type of challenge
+            sample_rate: Fraction of slices to include
+            volume_sample_rate: Fraction of volumes to include
+            use_dataset_cache: Whether to use dataset cache
+            crop_size: Size to crop input data
+            seed: Random seed
+            train_accelerations: List of acceleration factors for training
+            pad_sides: Whether to pad sides of kspace
+            **kwargs: Additional arguments
         """
-        self.files = files
-        self.acceleration = acceleration
-        self.acquisition = acquisition
+        self.data_path = data_path
+        self.transform = transform
+        self.challenge = challenge
+        self.sample_rate = sample_rate
+        self.volume_sample_rate = volume_sample_rate
+        self.use_dataset_cache = use_dataset_cache
         self.crop_size = crop_size
-        self.mode = mode
-        self.sample_rate = sample_rate if sample_rate is not None else 1.0
-        self.volume_sample_rate = volume_sample_rate if volume_sample_rate is not None else 1.0
-        self.use_seed = use_seed
+        self.seed = seed
+        self.train_accelerations = train_accelerations
         self.pad_sides = pad_sides
-        self.load_directly = load_directly
-        self.fix_acceleration = fix_acceleration
-
-        # Calculate the length of the dataset
+        self.recons_key = 'reconstruction_esc' if challenge == 'multicoil' else 'reconstruction_rss'
+        
+        # Set random seed for reproducibility
+        random.seed(seed)
+        
+        # Get file paths
         self.examples = []
         
-        # Load file paths
-        for fname in sorted(self.files):
-            try:
-                metadata = retrieve_metadata_from_file(fname)
-                num_slices = metadata.get('shape', [1, 1, 1])[0]
-                
-                if self.volume_sample_rate < 1.0:
-                    if self.use_seed:
-                        random.seed(tuple(map(ord, fname)))
-                    if random.random() > self.volume_sample_rate:
-                        continue
-
-                for slice_id in range(num_slices):
-                    if self.sample_rate < 1.0:
-                        if self.use_seed:
-                            random.seed(tuple(map(ord, fname)) + (slice_id,))
-                        if random.random() > self.sample_rate:
-                            continue
-                    
-                    self.examples.append((fname, slice_id))
-            except Exception as e:
-                print(f"Error loading metadata from {fname}: {e}")
+        if not Path(data_path).exists():
+            raise ValueError(f"Data path {data_path} does not exist")
+        
+        # Find all h5 files in the data directory
+        files = list(Path(data_path).glob('*.h5'))
+        
+        # Apply volume sampling if needed
+        if volume_sample_rate is not None and volume_sample_rate < 1.0:
+            random.shuffle(files)
+            num_files = round(len(files) * volume_sample_rate)
+            files = files[:num_files]
+        
+        # Process each file
+        for fname in sorted(files):
+            with h5py.File(fname, 'r') as hf:
+                num_slices = hf['kspace'].shape[0]
+                self.examples += [(fname, slice_id) for slice_id in range(num_slices)]
+        
+        # Apply slice sampling if needed
+        if sample_rate < 1.0:
+            random.shuffle(self.examples)
+            num_examples = round(len(self.examples) * sample_rate)
+            self.examples = self.examples[:num_examples]
+        
+        print(f"Found {len(self.examples)} examples in {data_path}")
     
     def __len__(self):
+        """Return the number of examples."""
         return len(self.examples)
     
     def __getitem__(self, idx):
-        """Get a training example"""
+        """Get a dataset example."""
         fname, slice_id = self.examples[idx]
         
+        # Initialize sensitivity_maps to None by default
+        sensitivity_maps = None
+        
+        # Load the data
         with h5py.File(fname, 'r') as hf:
             # Load kspace data
-            kspace = hf['kspace'][()]
+            kspace = hf['kspace'][slice_id]
+            kspace = torch.from_numpy(kspace).to(torch.float32)  # Ensure it's float32
             
-            # Handle different kspace formats
-            if len(kspace.shape) >= 4:
-                # Already in [coil, slice, height, width] format
-                kspace = kspace[:, slice_id:slice_id+1, :, :]
-            elif len(kspace.shape) == 3:
-                # In [slice, height, width] format or [coil, height, width]
-                if kspace.shape[0] <= 32:  # Likely [coil, height, width]
-                    kspace = kspace.reshape(kspace.shape[0], 1, kspace.shape[1], kspace.shape[2])
-                else:  # Likely [slice, height, width]
-                    kspace = kspace[slice_id:slice_id+1, :, :]
-                    kspace = kspace.reshape(1, *kspace.shape)  # Add coil dimension
+            # Load target image if available
+            if self.recons_key in hf:
+                target = hf[self.recons_key][slice_id]
+                target = torch.from_numpy(target).to(torch.float32)  # Ensure it's float32
+                if len(target.shape) == 2:  # Add channel dimension if needed
+                    target = target.unsqueeze(0)
             else:
-                raise ValueError(f"Unexpected kspace shape: {kspace.shape}")
+                target = None
             
-            # Check if k-space is already complex or real
-            is_complex = np.iscomplexobj(kspace)
+            # Load attributes
+            attrs = dict(hf.attrs) if hasattr(hf, 'attrs') else {}
             
-            if 'reconstruction_rss' in hf:
-                # If RSS reconstruction is provided, use it as the target
-                target = hf['reconstruction_rss'][()]
-                if len(target.shape) == 3:  # [slice, height, width]
-                    target = target[slice_id:slice_id+1]
-                elif len(target.shape) == 2:  # [height, width]
-                    target = target.reshape(1, *target.shape)  # Add slice dimension
+            # Load masks or create if not available
+            if 'mask' in hf:
+                mask = hf['mask'][slice_id]
+                mask = torch.from_numpy(mask).to(torch.float32)  # Ensure it's float32
             else:
-                # Otherwise, compute RSS from kspace
-                kspace_tensor = torch.from_numpy(kspace)
+                # Create mask based on acceleration factor
+                accel = random.choice(self.train_accelerations)
+                mask = create_mask(kspace.shape, accel)
+            
+            # Load sensitivity maps if available
+            if 'sensitivity_maps' in hf:
+                sensitivity_maps = hf['sensitivity_maps'][slice_id]
+                sensitivity_maps = torch.from_numpy(sensitivity_maps).to(torch.float32)  # Ensure it's float32
+        
+            # Print shapes for debugging
+            print(f"kspace shape: {kspace.shape}")
+            print(f"mask_tensor shape: {mask.shape}")
+            
+            # Check if data is already complex (ComplexDouble or ComplexFloat)
+            if torch.is_complex(kspace):
+                # Convert to real tensor with last dimension of size 2
+                kspace = torch.stack([kspace.real, kspace.imag], dim=-1).to(torch.float32)
+                print(f"Converted complex tensor to real tensor with complex dim: {kspace.shape}")
+            # Ensure kspace has complex dimension (last dim of size 2)
+            elif len(kspace.shape) == 0 or kspace.shape[-1] != 2:
+                zeros = torch.zeros_like(kspace)
+                kspace = torch.stack([kspace, zeros], dim=-1)
+                print(f"Added complex dimension to kspace: {kspace.shape}")
+            
+            # Check if mask is complex
+            if torch.is_complex(mask):
+                # Convert to real tensor with last dimension of size 2
+                mask = torch.stack([mask.real, mask.imag], dim=-1).to(torch.float32)
+                print(f"Converted complex mask to real tensor with complex dim: {mask.shape}")
+            # Ensure mask has complex dimension if it doesn't already
+            elif len(mask.shape) > 0 and mask.shape[-1] != 2:
+                mask_real = mask  # Original mask values become real part
+                mask_imag = torch.zeros_like(mask)  # Zeros for imaginary part
+                mask = torch.stack([mask_real, mask_imag], dim=-1)
+                print(f"Added complex dimension to mask: {mask.shape}")
+            
+            # Apply mask to kspace
+            kspace = apply_mask_to_kspace(kspace, mask)
+            
+            # Normalize the data if target is available
+            if target is not None:
+                target, mean, std = normalize(target)
+            else:
+                mean, std = None, None
+            
+            # Crop to desired size
+            if self.crop_size is not None:
+                kspace = complex_center_crop(kspace, self.crop_size)
+                if target is not None:
+                    # Handle target cropping
+                    if len(target.shape) > 0 and target.shape[-1] != 2:
+                        target_complex = target.unsqueeze(-1).repeat(1, 1, 1, 2)
+                    else:
+                        target_complex = target
+                    
+                    target = complex_abs(complex_center_crop(target_complex, self.crop_size))
+                    
+                    # Remove extra dimensions if needed
+                    if len(target.shape) > 3:
+                        target = target.squeeze(-1)
                 
-                # Handle complex data type
-                if is_complex:
-                    # Split complex data into real and imaginary parts
-                    kspace_real = torch.from_numpy(kspace.real).float()
-                    kspace_imag = torch.from_numpy(kspace.imag).float()
+                # Ensure sensitivity_maps exists before trying to crop it
+                if sensitivity_maps is not None:
+                    # Check if sensitivity_maps is complex
+                    if torch.is_complex(sensitivity_maps):
+                        sensitivity_maps = torch.stack([sensitivity_maps.real, sensitivity_maps.imag], dim=-1).to(torch.float32)
                     
-                    # Create a complex tensor with explicit real and imaginary parts
-                    kspace_complex = torch.stack([kspace_real, kspace_imag], dim=-1)
-                    
-                    # Compute RSS
-                    img = ifft2c(kspace_complex)
-                    target = rss(img, dim=0).numpy()
-                else:
-                    # If not already complex formatted
-                    # Reshape to [coil, height, width, complex=2] for ifft2c
-                    if kspace_tensor.dim() == 3:  # [coil, height, width]
-                        # Add complex dimension
-                        kspace_tensor = torch.stack([kspace_tensor, torch.zeros_like(kspace_tensor)], dim=-1)
-                    
-                    # Compute RSS
-                    img = ifft2c(kspace_tensor)
-                    target = rss(img, dim=0).numpy()
+                    # Handle sensitivity maps cropping
+                    if len(sensitivity_maps.shape) > 0 and sensitivity_maps.shape[-1] != 2:
+                        sens_complex = sensitivity_maps.unsqueeze(-1).repeat(1, 1, 1, 2)
+                        sensitivity_maps = complex_center_crop(sens_complex, self.crop_size)
+                    else:
+                        sensitivity_maps = complex_center_crop(sensitivity_maps, self.crop_size)
             
-            # Get metadata
-            metadata = {
-                'acquisition': str(hf.attrs.get('acquisition', 'unknown')),
-                'max': float(hf.attrs.get('max', 0.0)),
-                'norm': float(hf.attrs.get('norm', 1.0)),
-                'patient_id': str(hf.attrs.get('patient_id', '')),
-                'modality': str(hf.attrs.get('modality', '')),
-                'center': str(hf.attrs.get('center', '')),
-                'scanner': str(hf.attrs.get('scanner', ''))
+            # Convert fname to string if it's a Path object
+            fname_str = str(fname) if isinstance(fname, (Path, type(Path()))) else fname
+            
+            # Create batch dictionary
+            batch = {
+                'kspace': kspace,
+                'masked_kspace': kspace,  # Include both keys to handle variations in model
+                'mask': mask,
+                'mask_type': 'cartesian',  # Always provide a valid mask_type
+                'attrs': attrs if attrs is not None else {},
+                'crop_size': self.crop_size,
+                'fname': fname_str,  # Use string version of fname
+                'slice_num': slice_id
             }
-
-        # Convert to torch tensor and ensure proper data types
-        if is_complex:
-            kspace_real = torch.from_numpy(kspace.real).float()
-            kspace_imag = torch.from_numpy(kspace.imag).float()
-            kspace = torch.stack([kspace_real, kspace_imag], dim=-1)
-        else:
-            kspace = torch.from_numpy(kspace).float()
-        
-        # Create mask for undersampling if needed
-        mask = None
-        acceleration = 1
-        
-        if self.acceleration:
-            if isinstance(self.acceleration, list):
-                if self.mode == "train":
-                    acceleration = random.choice(self.acceleration)
-                else:
-                    acceleration = self.fix_acceleration if self.fix_acceleration else self.acceleration[0]
-            else:
-                acceleration = self.acceleration
             
-            # Create mask function based on acceleration rate
-            mask_func = get_mask_func(acceleration, calib_size=16)
-            mask = mask_func((kspace.shape[-2], kspace.shape[-1]))
-            
-            # Apply mask
-            mask_tensor = torch.from_numpy(mask).float()
-            if is_complex:
-                # Apply to both real and imaginary parts
-                kspace[..., 0] = kspace[..., 0] * mask_tensor[None, None, :, :]
-                kspace[..., 1] = kspace[..., 1] * mask_tensor[None, None, :, :]
+            # Add low frequencies if available in attrs
+            if attrs and 'num_low_frequencies' in attrs:
+                batch['num_low_frequencies'] = attrs['num_low_frequencies']
             else:
-                # Ensure kspace has proper dimensions for mask application
-                if kspace.dim() == 3:  # [coil, height, width]
-                    kspace = kspace * mask_tensor[None, :, :]
-                elif kspace.dim() == 4 and kspace.shape[1] == 1:  # [coil, slice=1, height, width]
-                    kspace = kspace * mask_tensor[None, None, :, :]
-
-        # Ensure kspace has complex dimension if it doesn't already
-        if not is_complex and kspace.dim() <= 4:  # No complex dimension yet
-            # Convert to complex format [coil, height, width, complex=2]
-            if kspace.dim() == 3:  # [coil, height, width]
-                kspace = torch.stack([kspace, torch.zeros_like(kspace)], dim=-1)
-            elif kspace.dim() == 4 and kspace.shape[1] == 1:  # [coil, slice=1, height, width]
-                kspace = torch.stack([kspace, torch.zeros_like(kspace)], dim=-1)
-        
-        # Convert target to tensor
-        target = torch.from_numpy(target).float()
-        
-        # Normalize kspace
-        kspace, mean, std = normalize_instance(kspace, eps=1e-11)
-        
-        # Normalize target
-        target = normalize_instance(target, mean, std, eps=1e-11)[0]
-        
-        # Apply crop if needed
-        if self.crop_size is not None:
-            kspace = complex_center_crop(kspace, self.crop_size)
-            target = complex_center_crop(target, self.crop_size)
-        
-        # Create sample dictionary
-        sample = {
-            'kspace': kspace,
-            'target': target,
-            'mask': mask_tensor if mask is not None else torch.ones((kspace.shape[-3], kspace.shape[-2]), dtype=torch.float),
-            'mean': mean,
-            'std': std,
-            'fname': fname,
-            'slice_id': slice_id,
-            'acceleration': acceleration,
-            'metadata': metadata
-        }
-        
-        return sample
-
+                # A reasonable default, adjust as needed
+                batch['num_low_frequencies'] = 8
+            
+            # Add max_value for normalization
+            if target is not None:
+                max_value = attrs.get('max_value', target.max().item())
+                batch['max_value'] = max_value
+                batch['target'] = target
+            else:
+                batch['max_value'] = 1.0
+            
+            # Only add sensitivity_maps if it's not None
+            if sensitivity_maps is not None:
+                batch['sensitivity_maps'] = sensitivity_maps
+            
+            # Apply transform if available
+            if self.transform:
+                batch = self.transform(batch)
+            
+            return batch
 
 class CMR2025DataModule(pl.LightningDataModule):
-    """
-    DataModule for the CMR2025 dataset
-    """
+    """Data module for CMR 2025 challenge."""
+    
     def __init__(
         self,
-        data_path: str,
-        train_path: Optional[str] = None,
-        val_path: Optional[str] = None,
-        test_path: Optional[str] = None,
-        sample_rate: Optional[float] = None,
-        volume_sample_rate: Optional[float] = None,
-        train_accelerations: Optional[List[int]] = None,
-        val_accelerations: Optional[List[int]] = None,
-        test_accelerations: Optional[List[int]] = None,
-        train_acquisition: Optional[List[str]] = None,
-        val_acquisition: Optional[List[str]] = None,
-        test_acquisition: Optional[List[str]] = None,
-        crop_size: Optional[Tuple[int, int]] = None,
-        batch_size: int = 16,
-        num_workers: Optional[int] = None,
-        distributed_sampler: bool = False,
-        use_seed: bool = True,
-        pad_sides: bool = False,
-        dataset_cache: bool = True,
-        fix_acceleration_val: Optional[int] = None,
-        load_directly: bool = False,
+        data_path='./h5_dataset',
+        train_path='./h5_dataset/train',
+        val_path='./h5_dataset/val',
+        test_path=None,
+        challenge='multicoil',
+        train_transform=None,
+        val_transform=None,
+        test_transform=None,
+        sample_rate=1.0,
+        volume_sample_rate=None,
+        train_accelerations=[4, 8, 12],
+        val_accelerations=[4, 8, 12],
+        test_accelerations=None,
+        crop_size=(320, 190),  # Adjusted to be smaller than smallest dimension
+        batch_size=1,
+        num_workers=4,
+        distributed_sampler=False,
+        use_dataset_cache=True,
+        use_seed=True,
+        seed=42,
+        val_split=None,
+        test_split=None,
+        pad_sides=False,
+        fix_acceleration_val=None,
         **kwargs
     ):
         """
+        Initialize the data module.
+        
         Args:
             data_path: Path to the dataset
-            train_path: Optional specific path to training data
-            val_path: Optional specific path to validation data
-            test_path: Optional specific path to test data
-            sample_rate: Fraction of slices to use
-            volume_sample_rate: Fraction of volumes to use
-            train_accelerations: List of acceleration rates for training
-            val_accelerations: List of acceleration rates for validation
-            test_accelerations: List of acceleration rates for testing
-            train_acquisition: List of acquisition types for training
-            val_acquisition: List of acquisition types for validation
-            test_acquisition: List of acquisition types for testing
-            crop_size: Size to crop the data to
+            train_path: Path to training data
+            val_path: Path to validation data
+            test_path: Path to test data
+            challenge: Type of challenge
+            train_transform: Transform for training data
+            val_transform: Transform for validation data
+            test_transform: Transform for test data
+            sample_rate: Fraction of slices to include
+            volume_sample_rate: Fraction of volumes to include
+            train_accelerations: List of acceleration factors for training
+            val_accelerations: List of acceleration factors for validation
+            test_accelerations: List of acceleration factors for testing
+            crop_size: Size to crop input data
             batch_size: Batch size
             num_workers: Number of workers for data loading
-            distributed_sampler: Whether to use distributed sampling
-            use_seed: Whether to use a fixed random seed
-            pad_sides: Whether to pad the sides of k-space
-            dataset_cache: Whether to cache the dataset
-            fix_acceleration_val: Fixed acceleration rate for validation
-            load_directly: Whether to load the data directly
+            distributed_sampler: Whether to use distributed sampler
+            use_dataset_cache: Whether to use dataset cache
+            use_seed: Whether to use fixed seed
+            seed: Random seed
+            val_split: Validation split
+            test_split: Test split
+            pad_sides: Whether to pad sides of kspace
+            fix_acceleration_val: Fixed acceleration factor for validation
+            **kwargs: Additional arguments
         """
         super().__init__()
-        self.data_path = data_path
-        self.train_path = train_path if train_path else os.path.join(data_path, 'train')
-        self.val_path = val_path if val_path else os.path.join(data_path, 'val')
-        self.test_path = test_path if test_path else val_path if val_path else os.path.join(data_path, 'val')
         
+        self.data_path = data_path
+        self.train_path = train_path
+        self.val_path = val_path
+        self.test_path = test_path
+        self.challenge = challenge
+        self.train_transform = train_transform
+        self.val_transform = val_transform
+        self.test_transform = test_transform
         self.sample_rate = sample_rate
         self.volume_sample_rate = volume_sample_rate
-        
         self.train_accelerations = train_accelerations
         self.val_accelerations = val_accelerations
         self.test_accelerations = test_accelerations
-        
-        self.train_acquisition = train_acquisition
-        self.val_acquisition = val_acquisition
-        self.test_acquisition = test_acquisition
-        
         self.crop_size = crop_size
         self.batch_size = batch_size
-        self.num_workers = num_workers if num_workers is not None else cpu_count() // 2
+        self.num_workers = num_workers
         self.distributed_sampler = distributed_sampler
+        self.use_dataset_cache = use_dataset_cache
         self.use_seed = use_seed
+        self.seed = seed
+        self.val_split = val_split
+        self.test_split = test_split
         self.pad_sides = pad_sides
-        self.dataset_cache = dataset_cache
         self.fix_acceleration_val = fix_acceleration_val
-        self.load_directly = load_directly
-        
-        # Set dataset instances to None initially
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
-        
-    def prepare_data(self):
-        """Prepare the data if needed"""
-        # Check if data directories exist
-        os.makedirs(self.data_path, exist_ok=True)
-        os.makedirs(self.train_path, exist_ok=True)
-        os.makedirs(self.val_path, exist_ok=True)
-        if self.test_path:
-            os.makedirs(self.test_path, exist_ok=True)
     
-    def setup(self, stage: Optional[str] = None):
-        """Set up the datasets for the given stage"""
+    def prepare_data(self):
+        """Prepare the data."""
+        # This is called only on 1 GPU/TPU in distributed
+        pass
+    
+    def setup(self, stage=None):
+        """Set up the datasets."""
+        # Called on every GPU/TPU
+        
         if stage == 'fit' or stage is None:
-            # Find training files
-            train_files = sorted(glob.glob(os.path.join(self.train_path, '*.h5')))
-            print(f"Found {len(train_files)} training files in {self.train_path}")
-            
-            if len(train_files) == 0:
-                print(f"Warning: No training files found in {self.train_path}")
-                print(f"Current directory: {os.getcwd()}")
-                try:
-                    print(f"Directory contents: {os.listdir(self.train_path)}")
-                except:
-                    print(f"Could not list contents of {self.train_path}")
-            
-            # Set up training dataset
             self.train_dataset = CMR2025Dataset(
-                files=train_files,
-                acceleration=self.train_accelerations,
-                acquisition=self.train_acquisition,
-                crop_size=self.crop_size,
-                mode='train',
+                data_path=self.train_path,
+                transform=self.train_transform,
+                challenge=self.challenge,
                 sample_rate=self.sample_rate,
                 volume_sample_rate=self.volume_sample_rate,
-                use_seed=self.use_seed,
-                pad_sides=self.pad_sides,
-                load_directly=self.load_directly
+                use_dataset_cache=self.use_dataset_cache,
+                crop_size=self.crop_size,
+                seed=self.seed if self.use_seed else None,
+                train_accelerations=self.train_accelerations,
+                pad_sides=self.pad_sides
             )
             
-            # Find validation files
-            val_files = sorted(glob.glob(os.path.join(self.val_path, '*.h5')))
-            print(f"Found {len(val_files)} validation files in {self.val_path}")
-            
-            if len(val_files) == 0:
-                print(f"Warning: No validation files found in {self.val_path}")
-                print(f"Current directory: {os.getcwd()}")
-                try:
-                    print(f"Directory contents: {os.listdir(self.val_path)}")
-                except:
-                    print(f"Could not list contents of {self.val_path}")
-            
-            # Set up validation dataset
             self.val_dataset = CMR2025Dataset(
-                files=val_files,
-                acceleration=self.val_accelerations,
-                acquisition=self.val_acquisition,
+                data_path=self.val_path,
+                transform=self.val_transform,
+                challenge=self.challenge,
+                sample_rate=1.0,  # Use all validation slices
+                volume_sample_rate=1.0,  # Use all validation volumes
+                use_dataset_cache=self.use_dataset_cache,
                 crop_size=self.crop_size,
-                mode='val',
-                sample_rate=1.0,  # Use all slices for validation
-                volume_sample_rate=1.0,  # Use all volumes for validation
-                use_seed=self.use_seed,
-                pad_sides=self.pad_sides,
-                load_directly=self.load_directly,
-                fix_acceleration=self.fix_acceleration_val
+                seed=self.seed if self.use_seed else None,
+                train_accelerations=self.val_accelerations if self.fix_acceleration_val is None else [self.fix_acceleration_val],
+                pad_sides=self.pad_sides
             )
-            
-        if stage == 'test' or stage is None:
-            # Find test files
-            test_path = self.test_path if self.test_path else self.val_path
-            test_files = sorted(glob.glob(os.path.join(test_path, '*.h5')))
-            print(f"Found {len(test_files)} test files in {test_path}")
-            
-            if len(test_files) == 0 and test_path != self.val_path:
-                print(f"Warning: No test files found in {test_path}")
-                print(f"Current directory: {os.getcwd()}")
-                try:
-                    print(f"Directory contents: {os.listdir(test_path)}")
-                except:
-                    print(f"Could not list contents of {test_path}")
-            
-            # Set up test dataset
+        
+        if stage == 'test' or stage is None and self.test_path:
             self.test_dataset = CMR2025Dataset(
-                files=test_files,
-                acceleration=self.test_accelerations,
-                acquisition=self.test_acquisition,
+                data_path=self.test_path,
+                transform=self.test_transform,
+                challenge=self.challenge,
+                sample_rate=1.0,  # Use all test slices
+                volume_sample_rate=1.0,  # Use all test volumes
+                use_dataset_cache=self.use_dataset_cache,
                 crop_size=self.crop_size,
-                mode='test',
-                sample_rate=1.0,  # Use all slices for testing
-                volume_sample_rate=1.0,  # Use all volumes for testing
-                use_seed=self.use_seed,
-                pad_sides=self.pad_sides,
-                load_directly=self.load_directly,
-                fix_acceleration=self.fix_acceleration_val
+                seed=self.seed if self.use_seed else None,
+                train_accelerations=self.test_accelerations,
+                pad_sides=self.pad_sides
             )
     
-    def train_dataloader(self) -> TRAIN_DATALOADERS:
-        """Return the training dataloader"""
+    def train_dataloader(self):
+        """Return the training dataloader."""
+        sampler = torch.utils.data.distributed.DistributedSampler(self.train_dataset) if self.distributed_sampler else None
+        
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
             num_workers=self.num_workers,
+            sampler=sampler,
+            shuffle=sampler is None,
             pin_memory=True,
-            drop_last=True
         )
     
-    def val_dataloader(self) -> EVAL_DATALOADERS:
-        """Return the validation dataloader"""
+    def val_dataloader(self):
+        """Return the validation dataloader."""
+        sampler = torch.utils.data.distributed.DistributedSampler(self.val_dataset, shuffle=False) if self.distributed_sampler else None
+        
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
             num_workers=self.num_workers,
+            sampler=sampler,
+            shuffle=False,
             pin_memory=True,
-            drop_last=False
         )
     
-    def test_dataloader(self) -> EVAL_DATALOADERS:
-        """Return the test dataloader"""
+    def test_dataloader(self):
+        """Return the test dataloader."""
+        if not hasattr(self, 'test_dataset'):
+            return None
+        
+        sampler = torch.utils.data.distributed.DistributedSampler(self.test_dataset, shuffle=False) if self.distributed_sampler else None
+        
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
             num_workers=self.num_workers,
+            sampler=sampler,
+            shuffle=False,
             pin_memory=True,
-            drop_last=False
         )

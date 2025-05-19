@@ -1,3 +1,8 @@
+
+# data/__init__.py
+from .cmr2025 import CMR2025Dataset, CMR2025DataModule
+
+__all__ = ["CMR2025Dataset", "CMR2025DataModule"]
 from .mri_data import (
     RawDataSample,
     BalanceSampler,

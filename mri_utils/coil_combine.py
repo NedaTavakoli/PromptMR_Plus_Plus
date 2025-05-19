@@ -12,6 +12,7 @@ from .fftc import fft2c_new as fft2c
 from .fftc import ifft2c_new as ifft2c
 
 
+
 def rss(data: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """
     Compute the Root Sum of Squares (RSS).

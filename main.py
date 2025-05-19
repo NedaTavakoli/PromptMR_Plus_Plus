@@ -14,7 +14,9 @@ import numpy as np
 from lightning.pytorch.cli import LightningCLI, SaveConfigCallback
 from lightning.pytorch.callbacks import BasePredictionWriter
 
-from mri_utils import save_reconstructions
+# from mri_utils import save_reconstructions
+from mri_utils.utils import save_reconstructions  # Import directly from the utils module
+
 from pl_modules import PromptMrModule
 
 
