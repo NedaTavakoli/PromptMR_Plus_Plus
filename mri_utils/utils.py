@@ -167,3 +167,56 @@ def load_kdata(filename):
     kdata = kdata['real'] + 1j*kdata['imag']
     return kdata
 
+# Add this to mri_utils/utils.py or create a new file
+def get_mask_func(mask_type, center_fractions, accelerations):
+    """
+    Get mask function for given mask type.
+    
+    Args:
+        mask_type: 'cartesian' or 'poisson_disc'
+        center_fractions: List of center fractions
+        accelerations: List of accelerations
+        
+    Returns:
+        Mask function that takes shape and returns a mask
+    """
+    import numpy as np
+    
+    if mask_type == 'cartesian':
+        def cartesian_mask(shape, seed, device):
+            rng = np.random.RandomState(seed)
+            acceleration = rng.choice(accelerations)
+            center_fraction = rng.choice(center_fractions)
+            
+            num_cols = shape[-2]
+            num_low_frequencies = int(round(num_cols * center_fraction))
+            
+            # Create mask
+            mask = np.zeros(num_cols, dtype=np.float32)
+            pad = (num_cols - num_low_frequencies + 1) // 2
+            mask[pad:pad + num_low_frequencies] = 1  # Center region is all 1s
+            
+            # Outer region gets some random samples
+            prob = (num_cols / acceleration - num_low_frequencies) / (num_cols - num_low_frequencies)
+            mask[mask == 0] = rng.random(len(mask[mask == 0])) < prob
+            
+            # Reshape to 2D
+            mask_shape = [1 for _ in shape]
+            mask_shape[-2] = num_cols
+            mask = mask.reshape(*mask_shape)
+            
+            # Convert to torch tensor
+            return torch.from_numpy(mask).to(device)
+        
+        return cartesian_mask
+    
+    elif mask_type == 'poisson_disc':
+        def poisson_disc_mask(shape, seed, device):
+            # TODO: Implement Poisson disc sampling
+            # For now, just return cartesian mask
+            return cartesian_mask(shape, seed, device)
+        
+        return poisson_disc_mask
+    
+    else:
+        raise ValueError(f"Unknown mask type: {mask_type}")

@@ -10,6 +10,12 @@ import lightning.pytorch as pl  # Make sure to use this import
 # Import the necessary functions for the patched forward method
 from mri_utils.coil_combine import sens_expand, sens_reduce
 
+# In data/cmr2025.py (fork)
+from mri_utils import rss, fft2c, ifft2c, complex_center_crop, complex_random_crop, get_mask_func 
+# (import only the functions that exist, omitting 'sense')
+# ... define CMR2025DataModule that computes coil sensitivity maps or RSS internally ...
+
+
 def complex_center_crop(data, crop_size):
     """
     Apply center crop to complex-valued tensor, with handling for crop sizes larger than input.

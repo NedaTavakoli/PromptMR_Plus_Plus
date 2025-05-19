@@ -97,3 +97,67 @@ def tensor_to_complex_np(data: torch.Tensor) -> np.ndarray:
         Complex numpy version of data.
     """
     return torch.view_as_complex(data).numpy()
+
+import torch
+
+def complex_center_crop(data, shape):
+    """
+    Apply center crop to complex-valued tensor.
+    
+    Args:
+        data: Input complex data with last dimension being 2 (real and imaginary)
+        shape: Desired output shape
+        
+    Returns:
+        Cropped data
+    """
+    if not isinstance(shape, (list, tuple)):
+        shape = (shape, shape)
+    
+    if all(x == y for x, y in zip(data.shape[-3:-1], shape)):
+        return data
+    
+    w_from = (data.shape[-2] - shape[0]) // 2
+    h_from = (data.shape[-3] - shape[1]) // 2
+    w_to = w_from + shape[0]
+    h_to = h_from + shape[1]
+    
+    if len(data.shape) == 3:
+        return data[h_from:h_to, w_from:w_to, :]
+    elif len(data.shape) == 4:
+        return data[:, h_from:h_to, w_from:w_to, :]
+    elif len(data.shape) == 5:
+        return data[:, :, h_from:h_to, w_from:w_to, :]
+    else:
+        raise ValueError(f"Unsupported data shape: {data.shape}")
+
+def complex_random_crop(data, shape):
+    """
+    Apply random crop to complex-valued tensor.
+    
+    Args:
+        data: Input complex data with last dimension being 2 (real and imaginary)
+        shape: Desired output shape
+        
+    Returns:
+        Cropped data
+    """
+    if not isinstance(shape, (list, tuple)):
+        shape = (shape, shape)
+    
+    if all(x == y for x, y in zip(data.shape[-3:-1], shape)):
+        return data
+    
+    w_from = torch.randint(0, data.shape[-2] - shape[0] + 1, (1,)).item()
+    h_from = torch.randint(0, data.shape[-3] - shape[1] + 1, (1,)).item()
+    w_to = w_from + shape[0]
+    h_to = h_from + shape[1]
+    
+    if len(data.shape) == 3:
+        return data[h_from:h_to, w_from:w_to, :]
+    elif len(data.shape) == 4:
+        return data[:, h_from:h_to, w_from:w_to, :]
+    elif len(data.shape) == 5:
+        return data[:, :, h_from:h_to, w_from:w_to, :]
+    else:
+        raise ValueError(f"Unsupported data shape: {data.shape}")
